@@ -31,6 +31,8 @@ from detectron2.utils import comm
 
 logger = logging.getLogger("detectron2")
 
+import torch
+torch.cuda.empty_cache()
 
 def do_test(cfg, model):
     if "evaluator" in cfg.dataloader:
@@ -69,6 +71,10 @@ def do_train(args, cfg):
 
     cfg.optimizer.params.model = model
     optim = instantiate(cfg.optimizer)
+
+    cfg.model.mask_on = False
+    cfg.model.roi_heads.mask_in_features = []
+    cfg.model.roi_heads.name = "StandardROIHeads"
 
     train_loader = instantiate(cfg.dataloader.train)
 
