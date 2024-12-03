@@ -51,3 +51,5 @@ _darcs
 /projects/*/datasets
 /models
 /snippet
+tools/output_1000ep/
+tools/logs/
