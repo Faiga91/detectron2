@@ -1,9 +1,17 @@
+import logging
 import torch
 from sklearn.metrics import confusion_matrix
 import seaborn as sns
 import matplotlib.pyplot as plt
 
 from torchvision.ops import box_iou
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+logging.getLogger("matplotlib").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
 
 
 class BinaryClassificationEvaluator:
@@ -37,21 +45,16 @@ class BinaryClassificationEvaluator:
             pred_boxes = pred["boxes"][pred["scores"] >= self.conf_threshold]
             target_boxes = target["boxes"]
 
-            if len(pred_boxes) == 0 and len(target_boxes) == 0:
-                # Case 1: True Negative (no predictions, no ground truth)
-                y_true.append(1)  # Ground truth is Normal Mucosa (class 1)
-                y_pred.append(1)  # Prediction is also Normal Mucosa (class 1)
-                continue
-
-            matched = torch.zeros(len(target_boxes), dtype=torch.bool)
+            # Initialize per-image counters
             tp, fp, fn = 0, 0, 0
+            matched = torch.zeros(len(target_boxes), dtype=torch.bool)
 
+            # Match predicted boxes with ground truth boxes
             for pb in pred_boxes:
                 ious = box_iou(pb.unsqueeze(0), target_boxes).squeeze(0)
 
                 if ious.numel() > 0:
                     max_iou, max_idx = ious.max(0)
-
                     if max_iou >= self.iou_threshold and not matched[max_idx]:
                         tp += 1
                         matched[max_idx] = True
@@ -60,22 +63,19 @@ class BinaryClassificationEvaluator:
                 else:
                     fp += 1
 
-            # Unmatched ground truth boxes are false negatives
+            # Count unmatched ground truth boxes as false negatives
             fn += (~matched).sum().item()
 
-            # Determine labels for the image
-            if tp > 0:
+            # Assign per-image labels
+            if len(target_boxes) > 0:
                 y_true.append(0)  # Ground truth is Polyp (class 0)
-                y_pred.append(0)  # Prediction is Polyp (class 0)
-            elif fp > 0:
-                y_true.append(1)  # Ground truth is Normal Mucosa (class 1)
-                y_pred.append(0)  # Prediction is Polyp (class 0, incorrect)
-            elif fn > 0:
-                y_true.append(0)  # Ground truth is Polyp (class 0)
-                y_pred.append(1)  # Prediction is Normal Mucosa (class 1)
             else:
                 y_true.append(1)  # Ground truth is Normal Mucosa (class 1)
-                y_pred.append(1)  # Prediction is also Normal Mucosa (class 1)
+
+            if tp > 0:
+                y_pred.append(0)  # Predicted as Polyp (class 0)
+            else:
+                y_pred.append(1)  # Predicted as Normal Mucosa (class 1)
 
         # Validation: Ensure all cases are accounted for
         total_samples = len(preds)  # Each image contributes one sample
