@@ -113,8 +113,14 @@ def visualize_predictions(cfg, image, outputs):
 
 if __name__ == "__main__":
     # Paths
+    ## Hyper-Kvasir
     test_json_path = "/dataset/hyper-kvasir/test-COCO-annotations.json"
     image_dir = "/dataset/hyper-kvasir/test"
+
+    ## OUS-20220203
+    # image_dir = "/dataset/ous-20220203-copy/images/test"
+    # test_json_path = "/dataset/ous-20220203-copy/annotations/test_updated.json"
+
     config_file = "../projects/ViTDet/configs/COCO/mask_rcnn_vitdet_b_100ep.py"
     weights_path = "output/model_final.pth"
     output_dir = "inference"
