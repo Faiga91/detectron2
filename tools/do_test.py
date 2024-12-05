@@ -20,6 +20,8 @@ from binary_classification_evaluator import BinaryClassificationEvaluator
 from tqdm import tqdm
 
 from omegaconf import OmegaConf
+from detectron2.data import transforms as T
+
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -29,12 +31,12 @@ logging.getLogger("matplotlib").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 ## OUS-20220203
-# test_json_path = "/dataset/ous-20220203-copy/annotations/test_updated.json"
-# image_dir = "/dataset/ous-20220203-copy/images/test"
+test_json_path = "/dataset/ous-20220203-copy/annotations/test_updated.json"
+image_dir = "/dataset/ous-20220203-copy/images/test"
 
 ## Hyper-Kvasir
-test_json_path = "/dataset/hyper-kvasir/test-COCO-annotations.json"
-image_dir = "/dataset/hyper-kvasir/test"
+# test_json_path = "/dataset/hyper-kvasir/test-COCO-annotations.json"
+# image_dir = "/dataset/hyper-kvasir/test"
 
 config_file = "../projects/ViTDet/configs/COCO/mask_rcnn_vitdet_b_100ep.py"
 weights_path = "output/model_final.pth"
@@ -62,10 +64,6 @@ def custom_mapper(dataset_dict, augmentations):
     if image is None:
         raise FileNotFoundError(f"Image not found: {dataset_dict['file_name']}")
     image = image[:, :, ::-1]  # Convert BGR to RGB
-
-    # Apply augmentations
-    from detectron2.data import transforms as T
-
     aug_input = T.AugInput(image)
     transforms = T.AugmentationList(augmentations)(aug_input)
     image = aug_input.image
@@ -117,15 +115,37 @@ logger.info(f"Loaded {len(dataset_dicts)} images from {test_json_path}")
 cfg = LazyConfig.load(config_file)
 
 augmentations = [instantiate(aug) for aug in cfg.dataloader.test.mapper.augmentations]
-
 wrapped_dataset = DatasetFromList(dataset_dicts, copy=False)
+logger.info("Dataset loaded.")
 
 mapper = DatasetMapper(
     is_train=False,
     augmentations=augmentations,
     image_format="BGR",  # Ensure your image format matches the dataset
 )
-mapped_dataset = list(map(lambda d: custom_mapper(d, augmentations), wrapped_dataset))
+
+
+class MappedDataset:
+    def __init__(self, dataset, mapper):
+        """
+        Args:
+            dataset (list or iterable): Original dataset.
+            mapper (callable): Function to map dataset entries.
+        """
+        self.dataset = dataset  # Ensure this is a valid iterable
+        self.mapper = mapper  # Ensure this is a callable function
+
+    def __len__(self):
+        return len(self.dataset)  # Dataset must support len()
+
+    def __getitem__(self, idx):
+        return self.mapper(self.dataset[idx])  # Apply mapping lazily
+
+
+mapped_dataset = MappedDataset(
+    dataset=wrapped_dataset, mapper=lambda d: custom_mapper(d, augmentations)
+)
+logger.info("Dataset mapped with custom mapper.")
 
 cfg.dataloader.test = {
     "_target_": "detectron2.data.build_detection_test_loader",
@@ -149,8 +169,11 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Initialize and load the model
 model = instantiate(cfg.model).to(device)
-DetectionCheckpointer(model).load(cfg.train.init_checkpoint)
 model.eval()
+
+logger.info(f"Model loaded on {device} in evaluation mode.")
+with torch.no_grad():
+    DetectionCheckpointer(model).load(cfg.train.init_checkpoint)
 logger.info(f"Model loaded from {cfg.train.init_checkpoint}")
 
 
@@ -177,7 +200,7 @@ def do_test(cfg, model):
         batch_size = test_dataloader_cfg.get("batch_size", 2)
         num_workers = test_dataloader_cfg.get("num_workers", 0)
 
-        subset_size = 100
+        subset_size = 1000
         results = []
         json_files = []
         for i in tqdm(range(0, len(dataset), subset_size)):
