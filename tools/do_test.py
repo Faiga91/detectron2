@@ -1,4 +1,6 @@
 import logging
+import shutil
+import os
 import json
 from detectron2.config import LazyConfig, instantiate
 from detectron2.checkpoint import DetectionCheckpointer
@@ -11,9 +13,13 @@ from detectron2.evaluation import print_csv_format
 
 from detectron2.structures import Instances, Boxes
 import torch
+from torch.utils.data import Subset, DataLoader
 import cv2
 
 from binary_classification_evaluator import BinaryClassificationEvaluator
+from tqdm import tqdm
+
+from omegaconf import OmegaConf
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -23,15 +29,19 @@ logging.getLogger("matplotlib").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 ## OUS-20220203
-test_json_path = "/dataset/ous-20220203-copy/annotations/test_updated.json"
-image_dir = "/dataset/ous-20220203-copy/images/test"
+# test_json_path = "/dataset/ous-20220203-copy/annotations/test_updated.json"
+# image_dir = "/dataset/ous-20220203-copy/images/test"
 
 ## Hyper-Kvasir
-# test_json_path = "/dataset/hyper-kvasir/test-COCO-annotations.json"
-# image_dir = "/dataset/hyper-kvasir/test"
+test_json_path = "/dataset/hyper-kvasir/test-COCO-annotations.json"
+image_dir = "/dataset/hyper-kvasir/test"
 
 config_file = "../projects/ViTDet/configs/COCO/mask_rcnn_vitdet_b_100ep.py"
 weights_path = "output/model_final.pth"
+
+
+def trivial_batch_collator(batch):
+    return batch
 
 
 def custom_mapper(dataset_dict, augmentations):
@@ -101,8 +111,7 @@ def custom_mapper(dataset_dict, augmentations):
 register_coco_instances("my_test_dataset", {}, test_json_path, image_dir)
 
 dataset_dicts = DatasetCatalog.get("my_test_dataset")
-logger.debug(dataset_dicts[:5])
-
+logger.info(f"Loaded {len(dataset_dicts)} images from {test_json_path}")
 
 # Load configuration and model
 cfg = LazyConfig.load(config_file)
@@ -123,7 +132,7 @@ cfg.dataloader.test = {
     "dataset": mapped_dataset,  # Use the preprocessed dataset
     "mapper": None,  # Mapper is already applied
     "num_workers": 0,
-    "batch_size": 4,
+    "batch_size": 2,
 }
 
 cfg.dataloader.evaluator = {
@@ -132,7 +141,6 @@ cfg.dataloader.evaluator = {
     "output_dir": "eval_results",
 }
 
-cfg.dataloader.test.batch_size = 2
 cfg.train.init_checkpoint = weights_path
 cfg.model.roi_heads.box_predictor.test_score_thresh = 0.5
 cfg.model.roi_heads.num_classes = 1
@@ -143,6 +151,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = instantiate(cfg.model).to(device)
 DetectionCheckpointer(model).load(cfg.train.init_checkpoint)
 model.eval()
+logger.info(f"Model loaded from {cfg.train.init_checkpoint}")
 
 
 def do_test(cfg, model):
@@ -156,21 +165,88 @@ def do_test(cfg, model):
     Returns:
         dict: Evaluation results and classification metrics.
     """
+    output_dir = "subset_results"
+    os.makedirs(output_dir, exist_ok=True)
 
     if "evaluator" in cfg.dataloader:
-        # Run inference
-        results = inference_on_dataset(
-            model,
-            instantiate(cfg.dataloader.test),
-            instantiate(cfg.dataloader.evaluator),
-        )
-        print_csv_format(results)
+        data_loader = instantiate(cfg.dataloader.test)
+        dataset = data_loader.dataset
+
+        test_dataloader_cfg = OmegaConf.to_container(cfg.dataloader.test, resolve=True)
+
+        batch_size = test_dataloader_cfg.get("batch_size", 2)
+        num_workers = test_dataloader_cfg.get("num_workers", 0)
+
+        subset_size = 100
+        results = []
+        json_files = []
+        for i in tqdm(range(0, len(dataset), subset_size)):
+            subset = Subset(dataset, list(range(i, min(i + subset_size, len(dataset)))))
+
+            # Wrap the subset in a DataLoader
+            subset_loader = DataLoader(
+                subset,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                collate_fn=trivial_batch_collator,
+            )
+
+            results_chunk = inference_on_dataset(
+                model,
+                subset_loader,
+                instantiate(cfg.dataloader.evaluator),
+            )
+
+            # Rename the generated JSON file for the current subset
+            subset_json_path = os.path.join(
+                output_dir, f"subset_{i // subset_size}.json"
+            )
+            generated_json_path = os.path.join(
+                cfg.dataloader.evaluator.output_dir, "coco_instances_results.json"
+            )
+            if os.path.exists(generated_json_path):
+                shutil.move(generated_json_path, subset_json_path)
+                json_files.append(subset_json_path)
+            else:
+                logger.warning(f"No results generated for subset {i // subset_size}")
+
+            results.append(results_chunk)
+
+        merged_results = {}
+        for chunk in results:
+            for key, value in chunk.items():
+                if key not in merged_results:
+                    merged_results[key] = [value]
+                else:
+                    merged_results[key].append(value)
+
+        final_results = {}
+        for key, values in merged_results.items():
+            if isinstance(values[0], dict):
+                merged_dict = {}
+                for sub_key in values[0]:
+                    sub_values = [v[sub_key] for v in values]
+                    merged_dict[sub_key] = sum(sub_values)
+                final_results[key] = merged_dict
+            else:
+                final_results[key] = sum(values)
+
+        merged_json_results = []
+        for json_file in json_files:
+            with open(json_file, "r") as f:
+                subset_results = json.load(f)
+                merged_json_results.extend(subset_results)
+
+        logger.info("Final results:")
+        logger.info(final_results)
+
+        print_csv_format(final_results)
 
     # Load saved predictions from coco_instances_results.json
     logger.info("Loading predictions from coco_instances_results.json...")
-    predictions_path = (
-        f"{cfg.dataloader.evaluator.output_dir}/coco_instances_results.json"
-    )
+    predictions_path = os.path.join(output_dir, "merged_coco_instances_results.json")
+    with open(predictions_path, "w") as f:
+        json.dump(merged_json_results, f)
 
     evaluator = BinaryClassificationEvaluator()
 
@@ -236,14 +312,17 @@ def do_test(cfg, model):
             output_path="eval_results/confusion_matrix.png",
         )
 
-        # Return results
-        return {
-            # "detection_results": results,
-            "binary_classification_metrics": metrics
-        }
+    # Return results
+    return {
+        "detection_results": final_results,
+        "binary_classification_metrics": metrics,
+    }
 
 
+logger.info("Running inference and evaluation...")
 results = do_test(cfg, model)
+
+
 for key, value in results.items():
     if key == "binary_classification_metrics":
         logger.info(f"{key}:")
