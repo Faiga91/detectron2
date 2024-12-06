@@ -13,13 +13,10 @@ from detectron2.evaluation import print_csv_format
 
 from detectron2.structures import Instances, Boxes
 import torch
-from torch.utils.data import Subset, DataLoader
 import cv2
 
 from binary_classification_evaluator import BinaryClassificationEvaluator
-from tqdm import tqdm
 
-from omegaconf import OmegaConf
 from detectron2.data import transforms as T
 
 
@@ -188,156 +185,97 @@ def do_test(cfg, model):
     Returns:
         dict: Evaluation results and classification metrics.
     """
-    output_dir = "subset_results"
+    output_dir = "results"
     os.makedirs(output_dir, exist_ok=True)
 
     if "evaluator" in cfg.dataloader:
+        # Load the full dataset
         data_loader = instantiate(cfg.dataloader.test)
-        dataset = data_loader.dataset
 
-        test_dataloader_cfg = OmegaConf.to_container(cfg.dataloader.test, resolve=True)
+        # Perform inference on the full dataset
+        results = inference_on_dataset(
+            model,
+            data_loader,
+            instantiate(cfg.dataloader.evaluator),
+        )
 
-        batch_size = test_dataloader_cfg.get("batch_size", 2)
-        num_workers = test_dataloader_cfg.get("num_workers", 0)
+        # Save the results
+        generated_json_path = os.path.join(
+            cfg.dataloader.evaluator.output_dir, "coco_instances_results.json"
+        )
+        final_results_path = os.path.join(output_dir, "coco_instances_results.json")
 
-        subset_size = 1000
-        results = []
-        json_files = []
-        for i in tqdm(range(0, len(dataset), subset_size)):
-            subset = Subset(dataset, list(range(i, min(i + subset_size, len(dataset)))))
-
-            # Wrap the subset in a DataLoader
-            subset_loader = DataLoader(
-                subset,
-                batch_size=batch_size,
-                num_workers=num_workers,
-                collate_fn=trivial_batch_collator,
-            )
-
-            results_chunk = inference_on_dataset(
-                model,
-                subset_loader,
-                instantiate(cfg.dataloader.evaluator),
-            )
-
-            # Rename the generated JSON file for the current subset
-            subset_json_path = os.path.join(
-                output_dir, f"subset_{i // subset_size}.json"
-            )
-            generated_json_path = os.path.join(
-                cfg.dataloader.evaluator.output_dir, "coco_instances_results.json"
-            )
-            if os.path.exists(generated_json_path):
-                shutil.move(generated_json_path, subset_json_path)
-                json_files.append(subset_json_path)
-            else:
-                logger.warning(f"No results generated for subset {i // subset_size}")
-
-            results.append(results_chunk)
-
-        merged_results = {}
-        for chunk in results:
-            for key, value in chunk.items():
-                if key not in merged_results:
-                    merged_results[key] = [value]
-                else:
-                    merged_results[key].append(value)
-
-        final_results = {}
-        for key, values in merged_results.items():
-            if isinstance(values[0], dict):
-                merged_dict = {}
-                for sub_key in values[0]:
-                    sub_values = [v[sub_key] for v in values]
-                    merged_dict[sub_key] = sum(sub_values)
-                final_results[key] = merged_dict
-            else:
-                final_results[key] = sum(values)
-
-        merged_json_results = []
-        for json_file in json_files:
-            with open(json_file, "r") as f:
-                subset_results = json.load(f)
-                merged_json_results.extend(subset_results)
+        if os.path.exists(generated_json_path):
+            shutil.move(generated_json_path, final_results_path)
+        else:
+            logger.warning("No results generated for the dataset.")
 
         logger.info("Final results:")
-        logger.info(final_results)
+        logger.info(results)
+        print_csv_format(results)
 
-        print_csv_format(final_results)
-
-    # Load saved predictions from coco_instances_results.json
+    # Load predictions from the final results JSON file
     logger.info("Loading predictions from coco_instances_results.json...")
-    predictions_path = os.path.join(output_dir, "merged_coco_instances_results.json")
-    with open(predictions_path, "w") as f:
-        json.dump(merged_json_results, f)
-
-    evaluator = BinaryClassificationEvaluator()
-
-    confusion_matrix = None
+    predictions_path = os.path.join(output_dir, "coco_instances_results.json")
     with open(predictions_path, "r") as f:
         predictions = json.load(f)
 
-        # Extract predictions and targets for binary classification evaluation
-        # logger.info("Extracting predictions and ground truth for binary evaluation...")
-        # dataloader = instantiate(cfg.dataloader.test)
-        # all_preds = []
-        # all_targets = []
+    evaluator = BinaryClassificationEvaluator()
+    confusion_matrix = None
 
-        for dataset_dict in dataset_dicts:  # Access the dataset directly
-            image_id = dataset_dict["image_id"]
+    for dataset_dict in dataset_dicts:  # Access the dataset directly
+        image_id = dataset_dict["image_id"]
 
-            # Match predictions to the current image
-            preds = [pred for pred in predictions if pred["image_id"] == image_id]
-            pred_boxes = torch.tensor(
-                [pred["bbox"] for pred in preds], dtype=torch.float32
-            )
-            pred_scores = torch.tensor(
-                [pred["score"] for pred in preds], dtype=torch.float32
-            )
-            pred_labels = torch.tensor(
-                [pred["category_id"] for pred in preds], dtype=torch.int64
-            )
-
-            # Get ground truth
-            gt_boxes = torch.tensor(
-                [anno["bbox"] for anno in dataset_dict["annotations"]],
-                dtype=torch.float32,
-            )
-            gt_labels = torch.tensor(
-                [anno["category_id"] for anno in dataset_dict["annotations"]],
-                dtype=torch.int64,
-            )
-
-            batch_preds = [
-                {"boxes": pred_boxes, "scores": pred_scores, "labels": pred_labels}
-            ]
-            batch_targets = [{"boxes": gt_boxes, "labels": gt_labels}]
-
-            batch_cm = evaluator.compute_confusion_matrix(batch_preds, batch_targets)
-            if confusion_matrix is None:
-                confusion_matrix = batch_cm
-            else:
-                confusion_matrix += batch_cm
-
-            del (
-                batch_preds,
-                batch_targets,
-                pred_scores,
-                pred_labels,
-                gt_labels,
-                gt_boxes,
-            )
-
-        metrics = evaluator.calculate_metrics(confusion_matrix)
-        evaluator.plot_confusion_matrix(
-            confusion_matrix,
-            class_names=["Polyp", "Normal Mucosa"],
-            output_path="eval_results/confusion_matrix.png",
+        # Match predictions to the current image
+        preds = [pred for pred in predictions if pred["image_id"] == image_id]
+        pred_boxes = torch.tensor([pred["bbox"] for pred in preds], dtype=torch.float32)
+        pred_scores = torch.tensor(
+            [pred["score"] for pred in preds], dtype=torch.float32
         )
+        pred_labels = torch.tensor(
+            [pred["category_id"] for pred in preds], dtype=torch.int64
+        )
+
+        # Get ground truth
+        gt_boxes = torch.tensor(
+            [anno["bbox"] for anno in dataset_dict["annotations"]],
+            dtype=torch.float32,
+        )
+        gt_labels = torch.tensor(
+            [anno["category_id"] for anno in dataset_dict["annotations"]],
+            dtype=torch.int64,
+        )
+
+        batch_preds = [
+            {"boxes": pred_boxes, "scores": pred_scores, "labels": pred_labels}
+        ]
+        batch_targets = [{"boxes": gt_boxes, "labels": gt_labels}]
+
+        batch_cm = evaluator.compute_confusion_matrix(batch_preds, batch_targets)
+        if confusion_matrix is None:
+            confusion_matrix = batch_cm
+        else:
+            confusion_matrix += batch_cm
+
+        del (
+            batch_preds,
+            batch_targets,
+            pred_scores,
+            pred_labels,
+            gt_labels,
+            gt_boxes,
+        )
+
+    metrics = evaluator.calculate_metrics(confusion_matrix)
+    evaluator.plot_confusion_matrix(
+        confusion_matrix,
+        class_names=["Polyp", "Normal Mucosa"],
+        output_path="eval_results/confusion_matrix.png",
+    )
 
     # Return results
     return {
-        "detection_results": final_results,
+        "detection_results": results,
         "binary_classification_metrics": metrics,
     }
 
